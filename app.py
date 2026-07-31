@@ -687,6 +687,11 @@ def main() -> None:
         "pathway memberships, and export results."
     )
 
+    if "query_df" not in st.session_state:
+        st.session_state.query_df = None
+        st.session_state.query_meta = None
+        st.session_state.query_gene = None
+
     # --- Sidebar ---
     with st.sidebar:
         st.header("1. Configure Query")
@@ -711,6 +716,12 @@ def main() -> None:
             help="Filter interactors below this confidence score.",
         )
 
+        search_clicked = st.button(
+            "Search Gene Interactions",
+            type="primary",
+            use_container_width=True,
+        )
+
         st.divider()
         if st.button("Run System Sanity Test", use_container_width=True):
             with st.spinner("Running sanity test against TP53..."):
@@ -725,17 +736,30 @@ def main() -> None:
                 for line in details:
                     st.write(line)
 
+    # --- Run search on button click ---
+    if search_clicked:
+        if not target_gene:
+            st.warning("Please enter a target gene symbol or ID before searching.")
+            return
+        if not ncbi_email:
+            st.warning("Please provide an NCBI email address in the sidebar.")
+            return
+
+        with st.spinner(f"Fetching interactions and pathways for {target_gene.upper()}..."):
+            df, meta = build_interactions_dataframe(target_gene, ncbi_email, min_score)
+
+        st.session_state.query_df = df
+        st.session_state.query_meta = meta
+        st.session_state.query_gene = target_gene
+
     # --- Main content ---
-    if not target_gene:
-        st.info("Enter a target gene symbol in the sidebar to begin.")
+    if st.session_state.query_df is None:
+        st.info("Enter a target gene symbol and click **Search Gene Interactions** to begin.")
         return
 
-    if not ncbi_email:
-        st.warning("Please provide an NCBI email address in the sidebar.")
-        return
-
-    with st.spinner(f"Fetching interactions and pathways for {target_gene.upper()}..."):
-        df, meta = build_interactions_dataframe(target_gene, ncbi_email, min_score)
+    df = st.session_state.query_df
+    meta = st.session_state.query_meta
+    target_gene = st.session_state.query_gene or target_gene
 
     if meta["errors"]:
         with st.expander("API warnings", expanded=False):
