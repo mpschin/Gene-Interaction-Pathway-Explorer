@@ -813,7 +813,10 @@ def build_network_figure(
     if graph.number_of_nodes() <= 1:
         return None
 
-    pos = nx.spring_layout(graph, seed=42, k=1.8)
+    try:
+        pos = nx.spring_layout(graph, seed=42, k=1.8)
+    except ModuleNotFoundError:
+        pos = nx.circular_layout(graph)
 
     edge_traces: list[go.Scatter] = []
     for source, target, data in graph.edges(data=True):
