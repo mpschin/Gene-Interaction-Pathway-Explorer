@@ -44,6 +44,7 @@ MAX_SECOND_DEGREE_EXPAND = 15
 MAX_SECOND_DEGREE_PER_GENE = 6
 MAX_SECOND_DEGREE_NODES = 50
 STRING_NETWORK_MIN_SCORE = 300
+MAX_CROSS_LAYER_EDGES = 500
 _gene_id_cache: dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
@@ -622,6 +623,119 @@ def fetch_second_degree_edges(
     return edges
 
 
+def fetch_string_network_edges(gene_symbols: list[str]) -> list[dict[str, Any]]:
+    """Fetch all STRING edges among a set of gene symbols."""
+    genes = sorted(
+        {
+            safe_value(gene, "").upper()
+            for gene in gene_symbols
+            if safe_value(gene, "") not in {"", "N/A"}
+        }
+    )
+    if len(genes) < 2:
+        return []
+
+    try:
+        response = requests.post(
+            f"{STRING_BASE}/json/network",
+            data={
+                "identifiers": "\n".join(genes),
+                "species": 9606,
+                "required_score": STRING_NETWORK_MIN_SCORE,
+            },
+            timeout=REQUEST_TIMEOUT,
+            headers={"Accept": "application/json"},
+        )
+        if not response.ok:
+            return []
+
+        payload = response.json()
+        if not isinstance(payload, list):
+            return []
+
+        edges: list[dict[str, Any]] = []
+        for item in payload:
+            source = safe_value(item.get("preferredName_A"), "").upper()
+            target = safe_value(item.get("preferredName_B"), "").upper()
+            if not source or not target or source == target:
+                continue
+            string_score = float(item.get("score", 0.0) or 0.0)
+            edges.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "score": int(min(round(string_score * 100), 100)),
+                    "interaction_type": infer_string_interaction_type(item),
+                }
+            )
+        return edges
+    except Exception:
+        return []
+
+
+def discover_second_degree_genes(
+    target_symbol: str,
+    first_degree_genes: list[str],
+) -> list[str]:
+    """Return 2nd-degree gene symbols discovered from 1st-degree expansion."""
+    edges = fetch_second_degree_edges(target_symbol, first_degree_genes)
+    return sorted({edge["target"] for edge in edges})
+
+
+def build_cross_layer_edges(
+    target_symbol: str,
+    first_degree_genes: list[str],
+    second_degree_genes: list[str],
+) -> list[dict[str, Any]]:
+    """
+    Return 1st↔2nd and 2nd↔2nd STRING edges among genes already in the network.
+    """
+    target = target_symbol.upper()
+    first_set = {
+        safe_value(gene, "").upper()
+        for gene in first_degree_genes
+        if safe_value(gene, "") not in {"", "N/A"}
+    }
+    second_set = {
+        safe_value(gene, "").upper()
+        for gene in second_degree_genes
+        if safe_value(gene, "") not in {"", "N/A"}
+    }
+    if not second_set:
+        return []
+
+    network_edges = fetch_string_network_edges(list(first_set | second_set))
+    cross_edges: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for edge in network_edges:
+        source = edge["source"]
+        partner = edge["target"]
+        if target in {source, partner}:
+            continue
+
+        source_first = source in first_set
+        source_second = source in second_set
+        partner_first = partner in first_set
+        partner_second = partner in second_set
+
+        if (source_first and partner_second) or (source_second and partner_first):
+            edge_layer = "first_second"
+        elif source_second and partner_second:
+            edge_layer = "second_second"
+        else:
+            continue
+
+        pair = tuple(sorted((source, partner)))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        cross_edges.append({**edge, "edge_layer": edge_layer})
+
+    cross_edges.sort(key=lambda item: item["score"], reverse=True)
+    return cross_edges[:MAX_CROSS_LAYER_EDGES]
+
+
 def calculate_string_interaction_score(
     string_score: float,
     has_ncbi: bool,
@@ -892,7 +1006,10 @@ def build_network_figure(
         for _, row in plot_df.iterrows()
         if safe_value(row["Gene Name"], "N/A") != "N/A"
     ]
-    second_degree_edges = fetch_second_degree_edges(center, first_degree_genes)
+    second_degree_genes = discover_second_degree_genes(center, first_degree_genes)
+    cross_layer_edges = build_cross_layer_edges(
+        center, first_degree_genes, second_degree_genes
+    )
 
     graph = nx.Graph()
     graph.add_node(center, node_type="target")
@@ -902,27 +1019,43 @@ def build_network_figure(
         if partner == "N/A":
             continue
         score = int(safe_value(row["Interaction Score"], "0").replace("N/A", "0"))
-        graph.add_node(partner, node_type="first_degree")
+        graph.add_node(partner.upper(), node_type="first_degree")
         graph.add_edge(
             center,
-            partner,
+            partner.upper(),
             weight=max(score, 1),
             interaction_type=safe_value(row["Interaction Type"]),
             score=score,
-            degree=1,
+            edge_layer="target_first",
         )
 
-    for edge in second_degree_edges:
+    for gene in second_degree_genes:
+        graph.add_node(gene, node_type="second_degree")
+
+    for edge in cross_layer_edges:
         source = edge["source"]
         partner = edge["target"]
-        graph.add_node(partner, node_type="second_degree")
+        if not graph.has_node(source) or not graph.has_node(partner):
+            continue
+        if graph.has_edge(source, partner):
+            existing = graph[source][partner]
+            if edge["score"] > existing.get("score", 0):
+                graph[source][partner].update(
+                    {
+                        "weight": max(edge["score"], 1),
+                        "interaction_type": edge["interaction_type"],
+                        "score": edge["score"],
+                        "edge_layer": edge["edge_layer"],
+                    }
+                )
+            continue
         graph.add_edge(
             source,
             partner,
             weight=max(edge["score"], 1),
             interaction_type=edge["interaction_type"],
             score=edge["score"],
-            degree=2,
+            edge_layer=edge["edge_layer"],
         )
 
     if graph.number_of_nodes() <= 1:
@@ -934,28 +1067,50 @@ def build_network_figure(
         pos = nx.circular_layout(graph)
 
     first_degree_edge_traces: list[go.Scatter] = []
-    second_degree_edge_traces: list[go.Scatter] = []
+    first_second_edge_traces: list[go.Scatter] = []
+    second_second_edge_traces: list[go.Scatter] = []
     for source, target, data in graph.edges(data=True):
         x0, y0 = pos[source]
         x1, y1 = pos[target]
         score = data.get("score", 30)
         itype = data.get("interaction_type", "Predicted")
-        degree = data.get("degree", 1)
+        edge_layer = data.get("edge_layer", "target_first")
 
-        if degree == 2:
-            second_degree_edge_traces.append(
+        if edge_layer == "first_second":
+            first_second_edge_traces.append(
                 go.Scatter(
                     x=[x0, x1, None],
                     y=[y0, y1, None],
                     mode="lines",
                     line=dict(
                         width=max(score / 20, 1.0),
-                        color="#94A3B8",
+                        color="#64748B",
                         dash="dot",
                     ),
                     hoverinfo="text",
                     text=(
-                        f"{source} — {target}<br>2nd degree<br>"
+                        f"{source} — {target}<br>1st ↔ 2nd degree<br>"
+                        f"Type: {itype}<br>Score: {score}"
+                    ),
+                    showlegend=False,
+                )
+            )
+            continue
+
+        if edge_layer == "second_second":
+            second_second_edge_traces.append(
+                go.Scatter(
+                    x=[x0, x1, None],
+                    y=[y0, y1, None],
+                    mode="lines",
+                    line=dict(
+                        width=max(score / 25, 0.8),
+                        color="#D97706",
+                        dash="dash",
+                    ),
+                    hoverinfo="text",
+                    text=(
+                        f"{source} — {target}<br>2nd ↔ 2nd degree<br>"
                         f"Type: {itype}<br>Score: {score}"
                     ),
                     showlegend=False,
@@ -973,7 +1128,7 @@ def build_network_figure(
                 mode="lines",
                 line=dict(width=max(score / 15, 1.5), color=color),
                 hoverinfo="text",
-                text=f"{source} — {target}<br>1st degree<br>Type: {itype}<br>Score: {score}",
+                text=f"{source} — {target}<br>Target ↔ 1st degree<br>Type: {itype}<br>Score: {score}",
                 showlegend=False,
             )
         )
@@ -1058,7 +1213,8 @@ def build_network_figure(
 
     fig = go.Figure(
         data=first_degree_edge_traces
-        + second_degree_edge_traces
+        + first_second_edge_traces
+        + second_second_edge_traces
         + [first_degree_trace, second_degree_trace, target_trace]
     )
     fig.update_layout(
@@ -1092,10 +1248,9 @@ def build_network_figure(
                     "<span style='color:#1ABC9C'>●</span> 1st degree<br>"
                     "<span style='color:#F59E0B'>●</span> 2nd degree<br><br>"
                     "<b>Edges</b><br>"
-                    "<span style='color:#7B2D8E'>—</span> Physical<br>"
-                    "<span style='color:#1ABC9C'>—</span> Signaling<br>"
-                    "<span style='color:#3498DB'>—</span> Pathway<br>"
-                    "<span style='color:#94A3B8'>⋯</span> 2nd degree"
+                    "<span style='color:#7B2D8E'>—</span> Target ↔ 1st<br>"
+                    "<span style='color:#64748B'>⋯</span> 1st ↔ 2nd<br>"
+                    "<span style='color:#D97706'>---</span> 2nd ↔ 2nd"
                 ),
                 bgcolor="rgba(255,255,255,0.95)",
                 bordercolor="#9CA3AF",
@@ -1312,8 +1467,9 @@ def main() -> None:
     st.subheader("Interactive Network Visualization")
     st.caption(
         "Network shows the target gene (purple), top 1st-degree interactors (teal), "
-        "and 2nd-degree partners (amber) linked through STRING evidence. "
-        "The table below contains the full 1st-degree result set."
+        "and 2nd-degree partners (amber) with all 1st↔2nd and 2nd↔2nd STRING "
+        "interactions among displayed nodes. The table below contains the full "
+        "1st-degree result set."
     )
     fig = build_network_figure(
         ncbi_info.get("symbol", target_gene.upper()), df
