@@ -1,6 +1,6 @@
 """
 Gene Interaction & Pathway Explorer
-Streamlit MVP for querying NCBI Entrez and Reactome REST APIs.
+For querying NCBI Entrez and Reactome.
 """
 
 from __future__ import annotations
