@@ -786,17 +786,23 @@ def build_interactions_dataframe(
 
 
 def build_network_figure(
-    target_gene: str, df: pd.DataFrame
+    target_gene: str, df: pd.DataFrame, max_nodes: int = 40
 ) -> go.Figure | None:
     """Build an interactive Plotly network graph for gene interactors."""
     if df.empty or (df["Gene Name"] == "N/A").all():
         return None
 
+    plot_df = df.copy()
+    plot_df["_score"] = pd.to_numeric(
+        plot_df["Interaction Score"], errors="coerce"
+    ).fillna(0)
+    plot_df = plot_df.sort_values("_score", ascending=False).head(max_nodes)
+
     graph = nx.Graph()
     center = target_gene.upper()
     graph.add_node(center, node_type="target")
 
-    for _, row in df.iterrows():
+    for _, row in plot_df.iterrows():
         partner = safe_value(row["Gene Name"])
         if partner == "N/A":
             continue
@@ -840,39 +846,81 @@ def build_network_figure(
         )
 
     node_x, node_y, node_text, node_color, node_size = [], [], [], [], []
+    target_x, target_y, target_text, target_size = [], [], [], 38
     for node, data in graph.nodes(data=True):
         x, y = pos[node]
-        node_x.append(x)
-        node_y.append(y)
-        node_text.append(node)
         if data.get("node_type") == "target":
-            node_color.append("#7B2D8E")
-            node_size.append(38)
+            target_x.append(x)
+            target_y.append(y)
+            target_text.append(node)
         else:
+            node_x.append(x)
+            node_y.append(y)
+            node_text.append(node)
             node_color.append("#1ABC9C")
             node_size.append(22)
 
-    node_trace = go.Scatter(
+    interactor_trace = go.Scatter(
         x=node_x,
         y=node_y,
         mode="markers+text",
         text=node_text,
         textposition="top center",
+        textfont=dict(
+            color="#111827",
+            size=12,
+            family="Arial, sans-serif",
+        ),
         hoverinfo="text",
-        marker=dict(size=node_size, color=node_color, line=dict(width=2, color="#FFFFFF")),
+        hovertext=node_text,
+        marker=dict(
+            size=node_size,
+            color=node_color,
+            line=dict(width=2, color="#FFFFFF"),
+            opacity=0.95,
+        ),
         showlegend=False,
     )
 
-    fig = go.Figure(data=edge_traces + [node_trace])
+    target_trace = go.Scatter(
+        x=target_x,
+        y=target_y,
+        mode="markers+text",
+        text=target_text,
+        textposition="top center",
+        textfont=dict(
+            color="#4C1D6B",
+            size=15,
+            family="Arial Black, Arial, sans-serif",
+        ),
+        hoverinfo="text",
+        hovertext=target_text,
+        marker=dict(
+            size=target_size,
+            color="#7B2D8E",
+            line=dict(width=2.5, color="#FFFFFF"),
+            opacity=1.0,
+        ),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=edge_traces + [interactor_trace, target_trace])
     fig.update_layout(
-        title="Interactive Network Visualization",
+        title=dict(
+            text="Interactive Network Visualization",
+            font=dict(color="#111827", size=18, family="Arial, sans-serif"),
+            x=0.02,
+            xanchor="left",
+        ),
         showlegend=False,
         hovermode="closest",
         margin=dict(l=10, r=10, t=50, b=10),
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        plot_bgcolor="#FAFAFA",
+        plot_bgcolor="#F3F4F6",
+        paper_bgcolor="#FFFFFF",
         height=520,
+        uniformtext=dict(mode="show", minsize=10),
         annotations=[
             dict(
                 x=0.99,
@@ -881,11 +929,12 @@ def build_network_figure(
                 yref="paper",
                 showarrow=False,
                 align="right",
+                font=dict(color="#111827", size=12, family="Arial, sans-serif"),
                 text="<b>Edge Legend</b><br><span style='color:#7B2D8E'>■</span> Physical<br>"
                 "<span style='color:#1ABC9C'>■</span> Signaling<br>"
                 "<span style='color:#3498DB'>■</span> Pathway",
-                bgcolor="rgba(255,255,255,0.85)",
-                bordercolor="#DDDDDD",
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor="#9CA3AF",
                 borderwidth=1,
             )
         ],
@@ -1097,6 +1146,11 @@ def main() -> None:
     render_metric_cards(df)
 
     st.subheader("Interactive Network Visualization")
+    if len(df) > 40:
+        st.caption(
+            "Showing the top 40 interactors by score in the network graph. "
+            "Use the table below for the full result set."
+        )
     fig = build_network_figure(
         ncbi_info.get("symbol", target_gene.upper()), df
     )
