@@ -117,6 +117,9 @@ def fetch_ncbi_gene_record(gene_query: str, email: str) -> dict[str, Any]:
         "summary": "N/A",
         "go_terms": [],
         "ncbi_reachable": False,
+        "species": "N/A",
+        "is_human": False,
+        "uniprot_acc": "N/A",
     }
 
     try:
@@ -150,6 +153,15 @@ def fetch_ncbi_gene_record(gene_query: str, email: str) -> dict[str, Any]:
         result["symbol"] = safe_value(
             gene_ref.get("Gene-ref_locus", gene_query.upper()), gene_query.upper()
         )
+
+        source = gene.get("Entrezgene_source", {}).get("BioSource", {}).get(
+            "BioSource_org", {}
+        ).get("Org-ref", {})
+        taxname = source.get("Org-ref_taxname", "N/A")
+        result["species"] = safe_value(str(taxname))
+        result["is_human"] = "homo sapiens" in str(taxname).lower()
+
+        result["uniprot_acc"] = _extract_uniprot_accession(gene)
 
         summary = gene.get("Entrezgene_summary")
         if summary:
@@ -201,6 +213,67 @@ def fetch_ncbi_gene_id_for_symbol(symbol: str, email: str) -> str:
     return "N/A"
 
 
+def _extract_uniprot_accession(gene: dict[str, Any]) -> str:
+    """Extract a UniProt accession from an NCBI Gene record when available."""
+    uniprot_pattern = re.compile(
+        r"^[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9][A-Z0-9]{3}[0-9]$"
+    )
+    for key in ("Entrezgene_comments", "Entrezgene_properties"):
+        for entry in gene.get(key, []):
+            for dbxref in entry.get("Gene-commentary_dbs", []):
+                db = dbxref.get("Dbtag", {}).get("Dbtag_db", "")
+                tag = dbxref.get("Dbtag", {}).get("Dbtag_tag", {}).get("Object-id", {})
+                acc = str(tag.get("Object-id_id", ""))
+                if str(db).lower() in {"uniprotkb", "uniprot"} and uniprot_pattern.match(acc):
+                    return acc
+            entry_text = str(entry)
+            for token in re.findall(
+                r"\b[OPQ][0-9][A-Z0-9]{3}[0-9]\b|\b[A-NR-Z][0-9][A-Z0-9]{3}[0-9]\b",
+                entry_text,
+            ):
+                if uniprot_pattern.match(token):
+                    return token
+    return "N/A"
+
+
+def resolve_reactome_query(ncbi: dict[str, Any], raw_query: str) -> str:
+    """Choose the best Reactome query string from NCBI metadata or raw input."""
+    symbol = safe_value(ncbi.get("symbol"), "")
+    if symbol and symbol != "N/A":
+        return symbol
+    if not raw_query.isdigit():
+        return raw_query.upper()
+    return raw_query
+
+
+def _extract_uniprot_accession(gene: dict[str, Any]) -> str:
+    """Extract a UniProt accession from an NCBI Gene record when available."""
+    uniprot_pattern = re.compile(r"^[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9][A-Z0-9]{3}[0-9]$")
+    for key in ("Entrezgene_comments", "Entrezgene_properties"):
+        for entry in gene.get(key, []):
+            for dbxref in entry.get("Gene-commentary_dbs", []):
+                db = dbxref.get("Dbtag", {}).get("Dbtag_db", "")
+                tag = dbxref.get("Dbtag", {}).get("Dbtag_tag", {}).get("Object-id", {})
+                acc = str(tag.get("Object-id_id", ""))
+                if str(db).lower() in {"uniprotkb", "uniprot"} and uniprot_pattern.match(acc):
+                    return acc
+            entry_text = str(entry)
+            for token in re.findall(r"\b[OPQ][0-9][A-Z0-9]{3}[0-9]\b|\b[A-NR-Z][0-9][A-Z0-9]{3}[0-9]\b", entry_text):
+                if uniprot_pattern.match(token):
+                    return token
+    return "N/A"
+
+
+def resolve_reactome_query(ncbi: dict[str, Any], raw_query: str) -> str:
+    """Choose the best Reactome query string from NCBI metadata or raw input."""
+    symbol = safe_value(ncbi.get("symbol"), "")
+    if symbol and symbol != "N/A":
+        return symbol
+    if not raw_query.isdigit():
+        return raw_query.upper()
+    return raw_query
+
+
 # ---------------------------------------------------------------------------
 # Reactome REST API
 # ---------------------------------------------------------------------------
@@ -217,6 +290,8 @@ def reactome_search_protein(gene_symbol: str) -> dict[str, Any]:
     response = requests.get(
         url, params=params, timeout=REQUEST_TIMEOUT, headers={"Accept": "application/json"}
     )
+    if response.status_code == 404:
+        return {}
     response.raise_for_status()
     payload = response.json()
     results = payload.get("results", [])
@@ -226,6 +301,18 @@ def reactome_search_protein(gene_symbol: str) -> dict[str, Any]:
     if not entries:
         return {}
     return entries[0]
+
+
+def reactome_lookup_protein(gene_symbol: str, uniprot_acc: str = "N/A") -> dict[str, Any]:
+    """Search Reactome by gene symbol, falling back to UniProt accession."""
+    protein = reactome_search_protein(gene_symbol)
+    if protein:
+        return protein
+    if uniprot_acc and uniprot_acc != "N/A":
+        protein = reactome_search_protein(uniprot_acc)
+        if protein:
+            return protein
+    return {}
 
 
 def reactome_interactor_summary(uniprot_acc: str) -> int:
@@ -350,26 +437,47 @@ def build_interactions_dataframe(
     if meta["ncbi"].get("go_terms"):
         default_go = meta["ncbi"]["go_terms"][0]
 
+    ncbi = meta["ncbi"]
+    reactome_query = resolve_reactome_query(ncbi, target_gene)
+
+    if ncbi.get("ncbi_reachable") and not ncbi.get("is_human", False):
+        meta["errors"].append(
+            f"Gene ID {ncbi.get('gene_id', target_gene)} resolves to "
+            f"{ncbi.get('symbol', target_gene)} ({ncbi.get('species', 'unknown species')}). "
+            "Reactome queries are limited to Homo sapiens proteins."
+        )
+
     # --- Reactome protein lookup ---
     uniprot_acc = None
     try:
-        protein = reactome_search_protein(target_gene)
-        meta["reactome_protein"] = protein
-        uniprot_acc = protein.get("referenceIdentifier")
-        meta["api_status"]["reactome"] = bool(uniprot_acc)
+        if ncbi.get("is_human", True) or not ncbi.get("ncbi_reachable"):
+            protein = reactome_lookup_protein(
+                reactome_query, ncbi.get("uniprot_acc", "N/A")
+            )
+            meta["reactome_protein"] = protein
+            uniprot_acc = protein.get("referenceIdentifier")
+            if not uniprot_acc and ncbi.get("uniprot_acc", "N/A") != "N/A":
+                uniprot_acc = ncbi.get("uniprot_acc")
+            meta["api_status"]["reactome"] = bool(uniprot_acc)
+            if ncbi.get("ncbi_reachable") and not protein and ncbi.get("is_human"):
+                meta["errors"].append(
+                    f"Reactome has no human protein match for "
+                    f"{reactome_query} (resolved from input '{target_gene}')."
+                )
     except Exception as exc:
         meta["errors"].append(f"Reactome search: {exc}")
 
     # --- Reactome pathways ---
     pathway_map: dict[str, str] = {}
     try:
-        pathways = reactome_fetch_pathways(target_gene)
-        meta["pathways"] = pathways
-        for idx, pathway in enumerate(pathways[:40]):
-            name = safe_value(pathway.get("name"))
-            pathway_map[name.lower()] = name
-            if idx < 5:
-                pathway_map[f"pathway_{idx}"] = name
+        if ncbi.get("is_human", True) or not ncbi.get("ncbi_reachable"):
+            pathways = reactome_fetch_pathways(reactome_query)
+            meta["pathways"] = pathways
+            for idx, pathway in enumerate(pathways[:40]):
+                name = safe_value(pathway.get("name"))
+                pathway_map[name.lower()] = name
+                if idx < 5:
+                    pathway_map[f"pathway_{idx}"] = name
     except Exception as exc:
         meta["errors"].append(f"Reactome pathways: {exc}")
 
@@ -698,7 +806,8 @@ def main() -> None:
         target_gene = st.text_input(
             "Target Gene Symbol / ID",
             value="TP53",
-            help="Human gene symbol (e.g. TP53) or Entrez Gene ID.",
+            help="Human gene symbol (e.g. TP53) or Entrez Gene ID (e.g. 7157). "
+            "Numeric IDs are resolved to gene symbols via NCBI before querying Reactome.",
         ).strip()
 
         ncbi_email = st.text_input(
