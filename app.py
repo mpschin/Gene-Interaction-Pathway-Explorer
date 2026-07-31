@@ -33,9 +33,13 @@ STANDARD_COLUMNS = [
     "Interaction Score",
 ]
 REACTOME_BASE = "https://reactome.org"
+STRING_BASE = "https://string-db.org/api"
 REQUEST_TIMEOUT = 30
 MAX_INTERACTION_PAGES = 15
 PAGE_SIZE = 50
+STRING_PARTNER_LIMIT = 500
+GENE_ID_BATCH_SIZE = 50
+_gene_id_cache: dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
 # Page configuration
@@ -200,6 +204,10 @@ def fetch_ncbi_gene_record(gene_query: str, email: str) -> dict[str, Any]:
 
 def fetch_ncbi_gene_id_for_symbol(symbol: str, email: str) -> str:
     """Look up Entrez Gene ID for an interactor symbol via Entrez."""
+    key = symbol.upper()
+    if key in _gene_id_cache:
+        return _gene_id_cache[key]
+
     configure_entrez(email)
     try:
         term = f"{symbol}[sym] AND Homo sapiens[orgn]"
@@ -207,10 +215,92 @@ def fetch_ncbi_gene_id_for_symbol(symbol: str, email: str) -> str:
         search = Entrez.read(handle)
         handle.close()
         if search.get("IdList"):
-            return search["IdList"][0]
+            gene_id = search["IdList"][0]
+            _gene_id_cache[key] = gene_id
+            return gene_id
     except Exception:
         pass
+    _gene_id_cache[key] = "N/A"
     return "N/A"
+
+
+def batch_fetch_ncbi_gene_ids(symbols: list[str], email: str) -> dict[str, str]:
+    """Resolve many gene symbols to Entrez IDs using fast batch lookup + NCBI fallback."""
+    mapping: dict[str, str] = {}
+    unique_symbols = sorted({sym.upper() for sym in symbols if sym and sym != "N/A"})
+
+    for sym in unique_symbols:
+        if sym in _gene_id_cache and _gene_id_cache[sym] != "N/A":
+            mapping[sym] = _gene_id_cache[sym]
+
+    pending = [sym for sym in unique_symbols if sym not in mapping]
+    if pending:
+        try:
+            payload = {
+                "q": ",".join(pending),
+                "scopes": "symbol",
+                "species": "human",
+                "fields": "symbol,entrezgene",
+                "size": len(pending),
+            }
+            response = requests.post(
+                "https://mygene.info/v3/query",
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            for item in response.json():
+                if not isinstance(item, dict):
+                    continue
+                query = safe_value(item.get("query"), "")
+                entrez = item.get("entrezgene")
+                if query and query != "N/A" and entrez:
+                    key = query.upper()
+                    gene_id = str(entrez)
+                    mapping[key] = gene_id
+                    _gene_id_cache[key] = gene_id
+        except Exception:
+            pass
+
+    pending = [sym for sym in unique_symbols if sym not in mapping]
+    if pending:
+        configure_entrez(email)
+        for start in range(0, len(pending), GENE_ID_BATCH_SIZE):
+            chunk = pending[start : start + GENE_ID_BATCH_SIZE]
+            if not chunk:
+                continue
+            try:
+                term = " OR ".join(f"{sym}[sym]" for sym in chunk) + " AND Homo sapiens[orgn]"
+                handle = Entrez.esearch(db="gene", term=term, retmax=len(chunk))
+                search = Entrez.read(handle)
+                handle.close()
+                gene_ids = search.get("IdList", [])
+                if not gene_ids:
+                    continue
+
+                handle = Entrez.efetch(db="gene", id=gene_ids, retmode="xml")
+                records = Entrez.read(handle)
+                handle.close()
+                if not isinstance(records, list):
+                    records = [records]
+
+                for gene in records:
+                    gene_ref = gene.get("Entrezgene_gene", {}).get("Gene-ref", {})
+                    symbol = safe_value(gene_ref.get("Gene-ref_locus"), "")
+                    track = gene.get("Entrezgene_track-info", {}).get("Gene-track", {})
+                    gene_id = safe_value(track.get("Gene-track_geneid"), "N/A")
+                    if symbol and symbol != "N/A" and gene_id != "N/A":
+                        key = symbol.upper()
+                        mapping[key] = gene_id
+                        _gene_id_cache[key] = gene_id
+            except Exception:
+                continue
+
+    for sym in unique_symbols:
+        mapping.setdefault(sym, _gene_id_cache.get(sym, "N/A"))
+        _gene_id_cache[sym] = mapping[sym]
+
+    return mapping
 
 
 def _extract_uniprot_accession(gene: dict[str, Any]) -> str:
@@ -400,6 +490,68 @@ def infer_interaction_type(evidences: int, score: float) -> str:
     return "Predicted"
 
 
+def infer_string_interaction_type(partner: dict[str, Any]) -> str:
+    """Map STRING subscores to an interaction type label."""
+    escore = float(partner.get("escore", 0.0) or 0.0)
+    dscore = float(partner.get("dscore", 0.0) or 0.0)
+    ascore = float(partner.get("ascore", 0.0) or 0.0)
+    tscore = float(partner.get("tscore", 0.0) or 0.0)
+    if escore >= 0.4 or dscore >= 0.7:
+        return "Physical"
+    if ascore >= 0.4 or tscore >= 0.7:
+        return "Signaling"
+    return "Predicted"
+
+
+def fetch_string_interactions(
+    gene_symbol: str,
+    gene_id: str,
+) -> list[dict[str, Any]]:
+    """
+    Fetch aggregated interaction partners from STRING DB.
+    Uses Entrez Gene ID or symbol and returns up to STRING_PARTNER_LIMIT partners.
+    """
+    identifier = gene_id if gene_id and gene_id != "N/A" else gene_symbol
+    url = f"{STRING_BASE}/json/interaction_partners"
+    params = {
+        "identifiers": identifier,
+        "species": 9606,
+        "limit": STRING_PARTNER_LIMIT,
+        "required_score": 0,
+    }
+    response = requests.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+        headers={"Accept": "application/json"},
+    )
+    if response.status_code == 404:
+        return []
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        return []
+    return payload
+
+
+def calculate_string_interaction_score(
+    string_score: float,
+    has_ncbi: bool,
+    has_pathway: bool,
+    in_reactome: bool = False,
+) -> int:
+    """Compute a 0-100 score for STRING-derived interaction evidence."""
+    score = min(max(string_score, 0.0), 1.0) * 55
+    score += min(string_score * 15, 15)
+    if has_ncbi:
+        score += 15
+    if has_pathway:
+        score += 10
+    if in_reactome:
+        score += 10
+    return int(min(round(score), 100))
+
+
 # ---------------------------------------------------------------------------
 # Data integration
 # ---------------------------------------------------------------------------
@@ -420,10 +572,10 @@ def build_interactions_dataframe(
         "reactome_protein": {},
         "pathways": [],
         "errors": [],
-        "api_status": {"ncbi": False, "reactome": False},
+        "api_status": {"ncbi": False, "reactome": False, "string": False},
     }
 
-    rows: list[dict[str, str | int]] = []
+    partner_rows: dict[str, dict[str, str | int]] = {}
 
     # --- NCBI ---
     try:
@@ -495,6 +647,7 @@ def build_interactions_dataframe(
 
     has_ncbi = meta["api_status"]["ncbi"]
     target_symbol = meta["ncbi"].get("symbol", target_gene.upper())
+    has_pathway = bool(meta["pathways"])
 
     for interactor in interactors:
         alias = safe_value(interactor.get("alias"))
@@ -503,16 +656,13 @@ def build_interactions_dataframe(
 
         reactome_score = float(interactor.get("score", 0.0) or 0.0)
         evidences = int(interactor.get("evidences", 0) or 0)
-        has_pathway = bool(meta["pathways"])
         score = calculate_interaction_score(
             reactome_score, evidences, has_ncbi, has_pathway
         )
         if score < min_score:
             continue
 
-        gene_id = fetch_ncbi_gene_id_for_symbol(alias, email)
         interaction_type = infer_interaction_type(evidences, reactome_score)
-
         pathway_name = default_pathway
         alias_lower = alias.lower()
         for key, pname in pathway_map.items():
@@ -520,20 +670,69 @@ def build_interactions_dataframe(
                 pathway_name = pname
                 break
 
-        rows.append(
-            {
-                "Gene Name": alias,
-                "Title": f"Interactor of {target_symbol} ({evidences} evidence records)",
-                "Gene ID": gene_id,
-                "Interaction Type": interaction_type,
-                "Gene Ontology": default_go,
-                "Pathway Name": pathway_name,
-                "Database Name": "Reactome/IntAct",
-                "Interaction Score": score,
-            }
-        )
+        partner_rows[alias.upper()] = {
+            "Gene Name": alias,
+            "Title": f"Interactor of {target_symbol} ({evidences} IntAct evidence records)",
+            "Gene ID": "N/A",
+            "Interaction Type": interaction_type,
+            "Gene Ontology": default_go,
+            "Pathway Name": pathway_name,
+            "Database Name": "Reactome/IntAct",
+            "Interaction Score": score,
+        }
 
-    if not rows and meta["pathways"]:
+    # --- STRING interactions (aggregated evidence aligned with NCBI Gene pages) ---
+    if ncbi.get("is_human", True) and ncbi.get("ncbi_reachable"):
+        try:
+            string_partners = fetch_string_interactions(
+                target_symbol,
+                ncbi.get("gene_id", "N/A"),
+            )
+            meta["api_status"]["string"] = bool(string_partners)
+            for partner in string_partners:
+                alias = safe_value(partner.get("preferredName_B"))
+                if alias.upper() in {target_symbol.upper(), "N/A"}:
+                    continue
+
+                string_score = float(partner.get("score", 0.0) or 0.0)
+                in_reactome = alias.upper() in partner_rows
+                score = calculate_string_interaction_score(
+                    string_score, has_ncbi, has_pathway, in_reactome
+                )
+                if score < min_score:
+                    continue
+
+                interaction_type = infer_string_interaction_type(partner)
+                pathway_name = default_pathway
+                alias_lower = alias.lower()
+                for key, pname in pathway_map.items():
+                    if alias_lower in key or alias_lower in pname.lower():
+                        pathway_name = pname
+                        break
+
+                existing = partner_rows.get(alias.upper())
+                if existing:
+                    existing["Interaction Score"] = max(
+                        int(existing["Interaction Score"]), score
+                    )
+                    existing["Database Name"] = "NCBI/STRING; Reactome/IntAct"
+                    if existing["Interaction Type"] == "Predicted" and interaction_type != "Predicted":
+                        existing["Interaction Type"] = interaction_type
+                else:
+                    partner_rows[alias.upper()] = {
+                        "Gene Name": alias,
+                        "Title": f"Interactor of {target_symbol} (STRING score {string_score:.3f})",
+                        "Gene ID": "N/A",
+                        "Interaction Type": interaction_type,
+                        "Gene Ontology": default_go,
+                        "Pathway Name": pathway_name,
+                        "Database Name": "NCBI/STRING",
+                        "Interaction Score": score,
+                    }
+        except Exception as exc:
+            meta["errors"].append(f"STRING interactions: {exc}")
+
+    if not partner_rows and meta["pathways"]:
         for pathway in meta["pathways"][:20]:
             pname = safe_value(pathway.get("name"))
             score = calculate_interaction_score(0.5, 2, has_ncbi, True)
@@ -547,18 +746,26 @@ def build_interactions_dataframe(
                 partner = match.group(1).upper()
             if partner in {"N/A", target_symbol.upper()}:
                 continue
-            rows.append(
-                {
-                    "Gene Name": partner,
-                    "Title": f"Pathway co-member via {target_symbol}",
-                    "Gene ID": fetch_ncbi_gene_id_for_symbol(partner, email),
-                    "Interaction Type": "Pathway",
-                    "Gene Ontology": default_go,
-                    "Pathway Name": pname,
-                    "Database Name": "Reactome",
-                    "Interaction Score": score,
-                }
-            )
+            partner_rows[partner] = {
+                "Gene Name": partner,
+                "Title": f"Pathway co-member via {target_symbol}",
+                "Gene ID": "N/A",
+                "Interaction Type": "Pathway",
+                "Gene Ontology": default_go,
+                "Pathway Name": pname,
+                "Database Name": "Reactome",
+                "Interaction Score": score,
+            }
+
+    gene_ids = batch_fetch_ncbi_gene_ids(list(partner_rows.keys()), email)
+    rows: list[dict[str, str | int]] = []
+    for partner_key, row in sorted(
+        partner_rows.items(),
+        key=lambda item: int(item[1]["Interaction Score"]),
+        reverse=True,
+    ):
+        row["Gene ID"] = gene_ids.get(partner_key, "N/A")
+        rows.append(row)
 
     df = pd.DataFrame(rows, columns=STANDARD_COLUMNS)
     if df.empty:
@@ -791,7 +998,7 @@ def render_metric_cards(df: pd.DataFrame) -> None:
 def main() -> None:
     st.title(f"🧬 {APP_TITLE}")
     st.caption(
-        "Query NCBI Entrez and Reactome to explore gene interactions, "
+        "Query NCBI Entrez, STRING, and Reactome to explore gene interactions, "
         "pathway memberships, and export results."
     )
 
